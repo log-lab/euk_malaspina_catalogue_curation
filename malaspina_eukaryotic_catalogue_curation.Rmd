@@ -1,0 +1,465 @@
+---
+title: "Eukaryotic Gene Catalogue Curation — Malaspina Expedition"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    self_contained: true
+description: >
+  Reproducible curation pipeline for the Malaspina eukaryotic gene catalogue.
+  Covers taxonomic assignment, Tax ID score filtering, MATOU validation, and
+  consensus taxonomy derivation.
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, message = FALSE, warning = FALSE)
+```
+
+---
+
+## Overview
+
+The initial gene catalogue contained prokaryotic ORFs. To ensure a reliable
+assessment of the metabolic potential of microbial eukaryotes in the water column,
+the catalogue was curated through a multi-step process:
+
+1. **Taxonomic Assignment** — three parallel MMseqs2 searches against eukaryotic and
+   mixed reference databases.
+2. **Tax ID Score Filtering** — retention of ORFs with hits in all three databases,
+   scored by a weighted combination of query coverage and percent identity.
+3. **MATOU Validation** — cross-validation against the Marine Atlas of Tara Oceans
+   Unigenes eukaryotic reference.
+4. **Consensus Taxonomy** — derivation of the lowest common taxonomic ancestor for
+   each retained gene.
+
+### Dependencies
+
+```{r dependencies}
+library(taxize)       # NCBI lineage retrieval
+library(data.table)   # fast in-memory operations
+library(dplyr)        # data manipulation
+library(stringr)      # string operations
+```
+
+---
+
+## Step 1 — Taxonomic Assignment
+
+Three parallel taxonomic assignments were performed using the `easy-taxonomy` module
+from MMseqs2 (Steinegger & Söding, 2017) against three reference databases:
+
+| Database | Content | Reference |
+|---|---|---|
+| **EukProt** | Eukaryotic sequences only | Richter et al., 2020 |
+| **MarFERReT v1.1.1** | Eukaryotic sequences only | Groussman et al., 2023 |
+| **MMETSP\_Uniclust90** | Eukaryotic + prokaryotic sequences | Keeling et al., 2014; Mirdita et al., 2017 |
+
+The MMETSP\_Uniclust90 database was assembled from the Marine Microbial Eukaryote
+Transcriptome Sequencing Project (MMETSP) and Uniclust90, and is the only database
+that includes prokaryotic references — allowing detection of potential prokaryotic
+contamination.
+
+LCA mode 4 was used (`--lca-mode 4`), which applies a top-hit-based LCA to produce
+conservative taxonomic assignments.
+
+Each run was submitted as an independent HPC job. The commands below can be
+adapted to any SLURM-based cluster by updating the database paths and output
+directories.
+
+### 1a — EukProt
+
+```{bash step1-eukprot}
+module load mmseqs2/13-45111
+
+QUERY=analyses/malaspina_catalogue_fasta/EukMPGC_95id_m250bp.faa
+DB=/path/to/EukProt.tax/sequenceDB
+OUTDIR=analyses/taxonomy_EukProt
+OUTPUT=${OUTDIR}/taxonomyResults_EukProt
+
+mkdir -p ${OUTDIR}
+
+mmseqs easy-taxonomy \
+  ${QUERY} ${DB} ${OUTPUT} ${OUTDIR}/tmp \
+  --lca-mode 4 \
+  --format-output "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,taxid,taxname,taxlineage" \
+  --threads 12
+```
+
+### 1b — MarFERReT
+
+```{bash step1-marferret}
+module load mmseqs2/13-45111
+
+QUERY=analyses/malaspina_catalogue_fasta/EukMPGC_95id_m250bp.faa
+DB=/path/to/MarFERReT/v1.1.1/mmseqs2/MarFERReTDB
+OUTDIR=analyses/taxonomy_MarFERReT
+OUTPUT=${OUTDIR}/taxonomyResults_MarFERReT
+
+mkdir -p ${OUTDIR}
+
+mmseqs easy-taxonomy \
+  ${QUERY} ${DB} ${OUTPUT} ${OUTDIR}/tmp \
+  --lca-mode 4 \
+  --format-output "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,taxid,taxname,taxlineage" \
+  --threads 12
+```
+
+### 1c — MMETSP\_Uniclust90
+
+```{bash step1-mmetsp}
+module load mmseqs2/13-45111
+
+QUERY=analyses/malaspina_catalogue_fasta/EukMPGC_95id_m250bp.faa
+DB=/path/to/MMETSP_zenodo_3247846_uniclust90_2018_08_seed_valid_taxids
+OUTDIR=analyses/taxonomy_MMETSP_Uni90
+OUTPUT=${OUTDIR}/taxonomyResults_MMETSP_Uni90
+
+mkdir -p ${OUTDIR}
+
+mmseqs easy-taxonomy \
+  ${QUERY} ${DB} ${OUTPUT} ${OUTDIR}/tmp \
+  --lca-mode 4 \
+  --format-output "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,taxid,taxname,taxlineage" \
+  --threads 12
+```
+
+---
+
+## Step 2 — Tax ID Score Comparison
+
+Only ORFs with hits in **all three databases** were retained for downstream curation
+(n = 17,348,923). This ensures that every retained ORF can be compared across
+databases and reliably assigned to eukaryotes.
+
+For each ORF, the best taxonomic hit was selected using the **Tax ID score**, defined
+as a weighted sum of query coverage and percent identity:
+
+$$\text{Tax ID score} = 0.6 \times \text{query coverage} + 0.4 \times \text{pident}$$
+
+Query coverage (alignment length / query length, capped at 100) was weighted more
+heavily than percent identity because a hit spanning a larger proportion of the query
+provides a more reliable basis for taxonomic assignment than a short, highly similar
+alignment — which may reflect conserved domains shared across distantly related taxa.
+
+Only **eukaryotic hits** (Domain = Eukaryota) with **e-value < 1e-5** and the
+**highest Tax ID score** per ORF were retained, yielding **8,139,291 putative
+eukaryotic ORFs**.
+
+### 2.1 — Load MMseqs2 top-hit alignment files
+
+```{r load-tophits}
+library(data.table)
+library(dplyr)
+library(stringr)
+
+# Read raw MMseqs2 top-hit alignment tables (no header — columns as per
+# --format-output string used in Step 1)
+eukprot_tophit   <- fread("analyses/taxonomy_EukProt/taxonomyResults_EukProt_tophit_aln")
+marferret_tophit <- fread("analyses/taxonomy_MarFERReT/taxonomyResults_MarFERReT_tophit_aln")
+mmetsp_tophit    <- fread("analyses/taxonomy_MMETSP_Uni90/taxonomyResults_MMETSP_Uni90_tophit_aln")
+
+# Save as RDS for fast reload
+saveRDS(eukprot_tophit,   "eukprot_tophit_alignment.RDS")
+saveRDS(marferret_tophit, "marferret_tophit_alignment.RDS")
+saveRDS(mmetsp_tophit,    "mmetsp_uni90_tophit_alignment.RDS")
+```
+
+### 2.2 — Identify genes with hits in all three databases
+
+```{r shared-genes}
+eukprot_tophit   <- readRDS("eukprot_tophit_alignment.RDS")
+marferret_tophit <- readRDS("marferret_tophit_alignment.RDS")
+mmetsp_tophit    <- readRDS("mmetsp_uni90_tophit_alignment.RDS")
+
+# Retain only ORFs present in all three search results (n = 17,348,923)
+shared_genes <- base::intersect(
+  base::intersect(eukprot_tophit$V1, marferret_tophit$V1),
+  mmetsp_tophit$V1
+)
+
+saveRDS(shared_genes, "genes_shared_all_databases.RDS")
+```
+
+### 2.3 — Compute Tax ID score and select best eukaryotic hit
+
+```{r taxid-score}
+shared_genes <- readRDS("genes_shared_all_databases.RDS")
+
+# Filter each database to shared genes and label the source
+eukprot_tophit <- readRDS("eukprot_tophit_alignment.RDS") %>%
+  filter(V1 %in% shared_genes) %>%
+  mutate(taxdb = "eukprot")
+
+marferret_tophit <- readRDS("marferret_tophit_alignment.RDS") %>%
+  filter(V1 %in% shared_genes) %>%
+  mutate(taxdb = "marferret")
+
+mmetsp_tophit <- readRDS("mmetsp_uni90_tophit_alignment.RDS") %>%
+  filter(V1 %in% shared_genes) %>%
+  mutate(taxdb = "mmetsp_uni90")
+
+# Combine all three into one table and assign column names
+all_hits <- rbind(eukprot_tophit, marferret_tophit, mmetsp_tophit)
+
+colnames(all_hits) <- c(
+  "query", "target", "pident", "alnlen", "mismatch", "gapopen",
+  "qstart", "qend", "tstart", "tend", "evalue",
+  "bits", "qlen", "tlen", "taxid", "taxname", "taxlineage", "taxdb"
+)
+
+# Compute Tax ID score and retain best eukaryotic hit per ORF
+best_eukaryotic_hits <- all_hits %>%
+  mutate(domain = str_extract(taxlineage, "(?<=d_)[^;]+")) %>%
+  mutate(domain = ifelse(is.na(domain), "unclassified", domain)) %>%
+  filter(evalue < 1e-5) %>%                              # significance threshold
+  mutate(q_cov = (alnlen / qlen) * 100) %>%
+  mutate(q_cov = ifelse(q_cov > 100, 100, q_cov)) %>%   # cap at 100
+  mutate(tax_id_score = (q_cov * 0.6) + (pident * 0.4)) %>%
+  group_by(query) %>%
+  slice_max(tax_id_score) %>%
+  ungroup()
+
+saveRDS(best_eukaryotic_hits, "best_taxid_score_hits.RDS")
+
+# Subset to eukaryotic domain only
+mmseqs2_eukaryotic_hits <- best_eukaryotic_hits %>%
+  filter(grepl("Eukaryot", domain))   # n = 8,139,291
+
+saveRDS(mmseqs2_eukaryotic_hits, "mmseqs2_eukaryotic_hits.RDS")
+
+eukaryotic_gene_ids <- unique(mmseqs2_eukaryotic_hits$query)
+saveRDS(eukaryotic_gene_ids, "eukaryotic_gene_ids.RDS")
+```
+
+---
+
+## Step 3 — MATOU Validation
+
+The 8,139,291 putative eukaryotic ORFs were cross-validated against the Marine Atlas
+of Tara Oceans Unigenes (MATOU) reference protein database (Carradec et al., 2018),
+derived from eukaryotic metatranscriptomics data, using the MMseqs2 `search` tool.
+Only the single best hit per query (`--max-seqs 1`) was retrieved. Hits with
+**e-value < 1e−5** were retained, yielding **7,714,686 eukaryotic ORFs**.
+
+### 3.1 — MMseqs2 search against MATOU
+
+**Inputs:**
+- `eukaryotic_gene_catalogue.fasta` — putative eukaryotic ORF sequences (Step 2 output)
+- `matou_reference_proteins.faa` — MATOU reference protein sequences
+
+**Output:** `matou_search_results.m8` — best-hit alignment table in BLAST tabular format.
+
+```{bash step3-matou}
+module load mmseqs2/13-45111
+
+# Build MMseqs2 databases from FASTA files
+mmseqs createdb eukaryotic_gene_catalogue.fasta queryDB
+mmseqs createdb matou_reference_proteins.faa    targetDB
+
+mkdir -p tmp
+mkdir -p MATOU_validation
+
+# Search: --max-seqs 1 retains only the single best hit per query
+mmseqs search queryDB targetDB resultDB tmp --max-seqs 1 --threads 12
+
+# Convert to BLAST tabular format (m8)
+mmseqs convertalis queryDB targetDB resultDB \
+  MATOU_validation/matou_search_results.m8 --threads 12
+```
+
+### 3.2 — Filter hits and extract verified gene list
+
+```{r step3-filter}
+library(data.table)
+library(dplyr)
+
+matou_hits <- fread(
+  "MATOU_validation/matou_search_results.m8",
+  col.names = c("gene_id", "target", "pident", "alnlen",
+                "mismatch", "gapopen", "qstart", "qend",
+                "tstart", "tend", "evalue", "bitscore")
+)
+
+saveRDS(matou_hits, "matou_search_results.RDS")
+
+# Retain only hits with e-value < 1e-5
+verified_hits <- matou_hits %>%
+  filter(evalue < 1e-5)
+
+verified_gene_catalogue <- unique(verified_hits$gene_id)  # n = 7,714,686
+
+saveRDS(verified_gene_catalogue, "verified_gene_catalogue.RDS")
+```
+
+---
+
+## Step 4 — Consensus Taxonomy Assignment
+
+Each verified gene may receive hits against multiple organisms during MMseqs2 search,
+resulting in a set of NCBI Taxonomy IDs rather than a single taxonomic assignment.
+To derive a robust and conservative taxonomic label for each gene, we compute a
+**lowest-common-ancestor (LCA)-style consensus**: the most specific NCBI taxon shared
+by the largest number of hits. If no consensus is found beyond the domain level, only
+the domain-level assignment is retained.
+
+### 4.1 — Retrieve NCBI Taxonomic Lineages
+
+Full NCBI lineages are retrieved using `taxize::classification()` with the `"ncbi"`
+database — consistent with the taxonomy used by MMseqs2. The result is flattened
+into a single data frame (one row per rank per taxid) and saved.
+
+**Input:**  `mmseqs2_eukaryotic_hits.RDS`
+**Output:** `ncbi_taxonomic_lineages.RDS` — columns: `name`, `rank`, `id`, `query`
+(where `query` is the queried taxid).
+
+```{r retrieve-lineages}
+library(taxize)
+
+mmseqs2_eukaryotic_hits <- readRDS("mmseqs2_eukaryotic_hits.RDS")
+
+ncbi_lineages_raw <- taxize::classification(
+  unique(mmseqs2_eukaryotic_hits$taxid),
+  db = "ncbi"
+)
+
+# Flatten list → data frame
+ncbi_lineages_df <- rbind(ncbi_lineages_raw)
+
+saveRDS(ncbi_lineages_df, "ncbi_taxonomic_lineages.RDS")
+```
+
+### 4.2 — Compute Consensus Taxonomy per Gene
+
+For each gene in the verified catalogue, `extract_consensus_taxonomy` identifies
+the deepest taxonomic node supported by the majority of its hits and trims the
+full lineage path to stop at that consensus point.
+
+**Inputs:**
+- `mmseqs2_eukaryotic_hits.RDS`
+- `verified_gene_catalogue.RDS` — gene IDs passing all quality filters (Step 3)
+- `ncbi_taxonomic_lineages.RDS`
+
+**Output:** `gene_consensus_taxonomy.RDS` — columns: `gene_id`, `taxid`,
+`taxon_name`, `taxpath`.
+
+```{r load-consensus-inputs}
+library(data.table)
+library(dplyr)
+
+mmseqs2_eukaryotic_hits <- readRDS("mmseqs2_eukaryotic_hits.RDS")
+verified_genes          <- readRDS("verified_gene_catalogue.RDS")
+ncbi_lineages_df        <- readRDS("ncbi_taxonomic_lineages.RDS")
+
+setDT(mmseqs2_eukaryotic_hits)
+setDT(ncbi_lineages_df)
+
+hits_verified <- mmseqs2_eukaryotic_hits %>%
+  filter(query %in% verified_genes)
+```
+
+```{r consensus-function}
+#' Consensus taxonomic assignment for a single gene.
+#'
+#' Algorithm:
+#'   1. Collect all NCBI taxids from the gene's MMseqs2 hits.
+#'   2. Retrieve the full ranked lineage (root → leaf) for each taxid.
+#'   3. Score each taxon by (a) how many taxids share it and
+#'      (b) how deep it sits in the tree. The winner is the most
+#'      frequent taxon; depth breaks ties toward the more specific node.
+#'   4. Trim the representative lineage string to end at the consensus taxon.
+#'
+#' @param gene_id  Character. A gene identifier present in `hits_verified$query`.
+#' @return A one-row data frame: gene_id, taxid, taxon_name, taxpath.
+
+extract_consensus_taxonomy <- function(gene_id) {
+
+  # 1. Taxids assigned to this gene across all MMseqs2 hits
+  gene_hits  <- hits_verified[which(hits_verified$query == gene_id), ]
+  hit_taxids <- unique(gene_hits$taxid)
+
+  # 2. Full NCBI lineages for those taxids (root → leaf order preserved)
+  gene_lineages <- ncbi_lineages_df %>%
+    filter(query %in% hit_taxids) %>%
+    distinct()
+
+  # 3. Consensus node:
+  #    num    = depth rank within each taxid's lineage (1 = root)
+  #    n_hits = number of taxids that share this taxon name
+  consensus_node <- gene_lineages %>%
+    mutate(num = row_number(), .by = "query") %>%
+    add_count(name, name = "n_hits") %>%
+    filter(n_hits == max(n_hits)) %>%   # most shared taxon(s)
+    filter(num  == max(num))  %>%       # deepest among ties
+    distinct()
+
+  # 4. Build and trim the taxonomic path.
+  #    Lineages of all taxids sharing the consensus node are concatenated;
+  #    the first occurrence of the consensus name in the string always falls
+  #    within the first lineage at the correct depth position.
+  lineage_string <- gene_lineages %>%
+    filter(query %in% consensus_node$query) %>%
+    summarise(taxpath = paste(name, collapse = ";")) %>%
+    pull(taxpath)
+
+  split_path    <- unlist(strsplit(lineage_string, ";"))
+  consensus_pos <- which(split_path == unique(consensus_node$name))[1]
+  trimmed_path  <- paste(split_path[1:consensus_pos], collapse = ";")
+
+  data.frame(
+    gene_id    = gene_id,
+    taxid      = unique(consensus_node$id),
+    taxon_name = unique(consensus_node$name),
+    taxpath    = trimmed_path
+  )
+}
+```
+
+```{r run-consensus}
+consensus_list <- lapply(verified_genes, extract_consensus_taxonomy)
+
+gene_consensus_taxonomy <- do.call(rbind, consensus_list)
+
+saveRDS(gene_consensus_taxonomy, "gene_consensus_taxonomy.RDS")
+```
+
+---
+
+## File Summary
+
+| File | Step | Role |
+|------|------|------|
+| `EukMPGC_95id_m250bp.faa` | 1 | Input — gene catalogue protein sequences |
+| `eukprot_tophit_alignment.RDS` | 2 | MMseqs2 EukProt top-hit alignment table |
+| `marferret_tophit_alignment.RDS` | 2 | MMseqs2 MarFERReT top-hit alignment table |
+| `mmetsp_uni90_tophit_alignment.RDS` | 2 | MMseqs2 MMETSP\_Uni90 top-hit alignment table |
+| `genes_shared_all_databases.RDS` | 2 | Gene IDs with hits in all three databases (n = 17,348,923) |
+| `best_taxid_score_hits.RDS` | 2 | Best hit per ORF ranked by Tax ID score |
+| `mmseqs2_eukaryotic_hits.RDS` | 2 | Eukaryotic hits only (n = 8,139,291) |
+| `eukaryotic_gene_ids.RDS` | 2 | Vector of eukaryotic ORF identifiers |
+| `eukaryotic_gene_catalogue.fasta` | 3 | Input — putative eukaryotic ORF sequences |
+| `matou_reference_proteins.faa` | 3 | Input — MATOU reference protein database |
+| `matou_search_results.RDS` | 3 | MMseqs2 search results against MATOU |
+| `verified_gene_catalogue.RDS` | 3 | ORFs validated against MATOU (n = 7,714,686) |
+| `ncbi_taxonomic_lineages.RDS` | 4 | Full NCBI lineages per taxid (taxize output) |
+| `gene_consensus_taxonomy.RDS` | 4 | **Final output** — consensus taxonomy per gene |
+
+---
+
+## Data Availability
+
+The data files accompanying this pipeline — including the curated gene catalogue
+(FASTA), consensus taxonomy table, ORF and KO count tables, and the KO–ORF key —
+are deposited on Zenodo: [https://doi.org/10.5281/zenodo.XXXXXXX](https://doi.org/10.5281/zenodo.XXXXXXX)
+
+---
+
+## Session Info
+
+```{r session-info, eval=TRUE, echo=TRUE}
+sessionInfo()
+```
