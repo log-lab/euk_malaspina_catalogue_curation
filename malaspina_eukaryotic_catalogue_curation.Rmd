@@ -454,7 +454,7 @@ saveRDS(gene_consensus_taxonomy, "gene_consensus_taxonomy.RDS")
 
 The data files accompanying this pipeline — including the curated gene catalogue
 (FASTA), consensus taxonomy table, ORF and KO count tables, and the KO–ORF key —
-are deposited on Zenodo: [https://doi.org/10.5281/zenodo.XXXXXXX](https://doi.org/10.5281/zenodo.XXXXXXX)
+are deposited on Zenodo: [https://doi.org/10.5281/zenodo.23557900](https://doi.org/10.5281/zenodo.23557900)
 
 ---
 
