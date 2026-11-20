@@ -18,4 +18,4 @@ The pipeline filters a mixed prokaryotic/eukaryotic ORF catalogue down to a cura
 
 ## Data
 
-Data files accompanying this pipeline are deposited on Zenodo: https://doi.org/10.5281/zenodo.23557901
+Data files accompanying this pipeline are deposited on Zenodo: https://doi.org/10.5281/zenodo.23557900.
