@@ -19,3 +19,7 @@ The pipeline filters a mixed prokaryotic/eukaryotic ORF catalogue down to a cura
 ## Data
 
 Data files accompanying this pipeline are deposited on Zenodo: https://doi.org/10.5281/zenodo.23557900.
+
+## Related publication
+
+The catalogue is described in: Greco M. et al. (2026) *Depth structures metabolic potential and warming responses in marine microbial eukaryotes*. bioRxiv. https://doi.org/10.64898/2026.11.10.765571
